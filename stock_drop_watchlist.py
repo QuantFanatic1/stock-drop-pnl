@@ -1,0 +1,1097 @@
+#!/usr/bin/env python3
+"""
+Stock Drop Watchlist Generator
+-------------------------------
+Runs after the daily stock_drop_alert.py to produce a next-morning
+watchlist of qualified plays based on tiered VIX / TP / SL rules.
+
+Reads today's (or specified date's) alert file, checks VIX, applies
+drop-size filters, determines call/put direction from 5-year history
+(equal-weight closed 10-day windows over 5 years),
+and outputs a ranked watchlist with entry rules.
+
+Usage:
+    python stock_drop_watchlist.py                  # Use today's alert
+    python stock_drop_watchlist.py --date 2026-03-18  # Specific date
+    python stock_drop_watchlist.py --vix-override 18.5  # Override VIX
+
+Output: Stock_Drop_Alert/Stock_Drop_Watchlist_{date}.txt
+"""
+
+import os
+import re
+import sys
+import time
+import argparse
+import subprocess
+import requests
+from datetime import datetime, timedelta
+from dotenv import load_dotenv
+from tabulate import tabulate
+
+from stock_drop_exit_rules import (
+    DROP_BUCKETS, STANDARD_SL_PCT, numbered_watchlist_blocked,
+    standard_take_profit,
+)
+
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(os.path.join(_SCRIPT_DIR, '.env'))
+
+FMP_API_KEY = os.getenv('FMP_API_KEY')
+FMP_BASE_V3 = 'https://financialmodelingprep.com/api/v3'
+POLYGON_API_KEY = os.getenv('POLYGON_API_KEY')
+POLYGON_BASE = 'https://api.polygon.io'
+
+# Polygon rate limiting
+_last_polygon_ts = 0.0
+POLYGON_MIN_INTERVAL = 0.35
+
+from datetime import date as _date_type
+
+ALERT_DIR = os.path.join(_SCRIPT_DIR, 'Stock_Drop_Alert')
+VIX_HISTORY = os.path.join(_SCRIPT_DIR, 'vix_history.csv')
+
+DROP_THRESHOLD = -5.0
+MIN_HIST_DROPS = 5          # closed 10d windows inside the 5-year lookback
+FORWARD_DAYS = 10
+
+# ── Quality Filters ───────────────────────────────────────────────────────────
+MIN_MARKET_CAP = 100_000_000   # $100M minimum
+MIN_STOCK_PRICE = 50           # $50 minimum (0% WR under $50 in backtest)
+MIN_DTE_CALENDAR = 30          # 30+ calendar days to expiry — theta decay protection
+MIN_HIST_WIN_RATE = 50         # Historical 10D win rate >= 50%
+MIN_OPTIONS_VOLUME = 5_000     # Total options volume on drop day >= 5,000 contracts
+MIN_CONTRACT_VOLUME = 50       # Best-strike contract must trade >= 50 contracts on drop day
+REPEAT_DROP_WARN = 3           # Flag 3rd+ drops as lower confidence
+
+
+def _is_third_friday(d):
+    """Check if a date is the 3rd Friday of its month, or the Thursday before
+    when that Friday is a market holiday (e.g. Juneteenth, Good Friday)."""
+    from market_holidays import is_market_holiday
+    # Standard case: 3rd Friday (day 15-21, weekday=Friday)
+    if d.weekday() == 4 and 15 <= d.day <= 21:
+        return True
+    # Holiday case: Thursday before 3rd Friday when Friday is a market holiday
+    if d.weekday() == 3 and 14 <= d.day <= 20:
+        friday = d + timedelta(days=1)
+        if is_market_holiday(friday.strftime('%Y-%m-%d')):
+            return True
+    return False
+
+# Take-profit: stock_drop_exit_rules.standard_take_profit (replay table).
+# Stop: STANDARD_SL_PCT (-40). The numbered list still uses the old VIX caps.
+
+# Filters
+EXCLUDED_SUFFIXES = ('-WT', '-WS', '-UN', '-RT', '-R', '-V', '.WS', '.WT')
+KNOWN_LEVERAGED = frozenset({
+    'TQQQ', 'SQQQ', 'SPXL', 'SPXS', 'UPRO', 'SPXU', 'TNA', 'TZA',
+    'UDOW', 'SDOW', 'LABU', 'LABD', 'FAS', 'FAZ', 'NUGT', 'DUST',
+    'JNUG', 'JDST', 'ERX', 'ERY', 'TECL', 'TECS', 'FNGU', 'FNGD',
+    'SOXL', 'SOXS', 'UVXY', 'SVXY', 'BOIL', 'KOLD', 'UCO', 'SCO',
+    'YANG', 'YINN', 'GUSH', 'DRIP', 'NAIL', 'DRV', 'CURE', 'PILL',
+    'BULZ', 'BERZ', 'WEBL', 'WEBS', 'RETL', 'TPOR', 'DPST', 'BNKU',
+})
+LEVERAGED_NAME_RE = re.compile(
+    r'(?i)\b(2x|3x|-2x|-3x|ultra|leveraged|proshares|direxion|microsectors)\b'
+)
+
+# ── Alert file parsing ────────────────────────────────────────────────────────
+
+DROP_LINE_RE = re.compile(
+    r'✓\s+([A-Z][A-Z0-9]{0,5}):\s+'
+    r'(-?\d+\.?\d*)%\s+drop\s+@\s+\$([\d,.]+),\s+'
+    r'Market\s+Cap:\s+\$([\d.]+)([TBM])'
+)
+
+
+def find_alert_file(target_date):
+    """Find the alert file for a given date."""
+    if not os.path.isdir(ALERT_DIR):
+        return None
+    # Check multiple naming patterns
+    patterns = [
+        f'Stock_Drop_Alert_{target_date}.txt',
+        f'Stock_Drop_Alert_{target_date}_*.txt',
+    ]
+    import glob
+    for pat in patterns:
+        matches = glob.glob(os.path.join(ALERT_DIR, pat))
+        if matches:
+            return sorted(matches)[-1]  # latest if multiple
+    # Also check parent dir
+    for pat in patterns:
+        matches = glob.glob(os.path.join(_SCRIPT_DIR, pat))
+        if matches:
+            return sorted(matches)[-1]
+    return None
+
+
+def parse_alert_file(filepath):
+    """Parse drops from a single alert file."""
+    stocks = []
+    seen = set()
+    with open(filepath, 'r') as f:
+        for line in f:
+            m = DROP_LINE_RE.search(line)
+            if not m:
+                continue
+            symbol = m.group(1)
+            if symbol in seen:
+                continue
+            seen.add(symbol)
+            drop_pct = float(m.group(2))
+            price = float(m.group(3).replace(',', ''))
+            cap_val = float(m.group(4))
+            cap_suffix = m.group(5)
+            if cap_suffix == 'T':
+                market_cap = cap_val * 1e12
+            elif cap_suffix == 'B':
+                market_cap = cap_val * 1e9
+            else:
+                market_cap = cap_val * 1e6
+            stocks.append({
+                'symbol': symbol,
+                'drop_pct': drop_pct,
+                'price': price,
+                'market_cap': market_cap,
+            })
+    return stocks
+
+
+# ── VIX ───────────────────────────────────────────────────────────────────────
+
+def fetch_current_vix():
+    """Fetch current VIX from FMP."""
+    url = f'{FMP_BASE_V3}/quote/%5EVIX?apikey={FMP_API_KEY}'
+    try:
+        resp = requests.get(url, timeout=10)
+        data = resp.json()
+        if isinstance(data, list) and data:
+            return data[0].get('price', 0)
+    except Exception:
+        pass
+    return None
+
+
+def get_vix_from_history(target_date):
+    """Get VIX for a specific date from vix_history.csv."""
+    if not os.path.exists(VIX_HISTORY):
+        return None
+    try:
+        import pandas as pd
+        vdf = pd.read_csv(VIX_HISTORY)
+        day_rows = vdf[vdf['Date'] == target_date]
+        if not day_rows.empty:
+            # Prefer midday reading
+            midday = day_rows[day_rows['Time_PST'] == '12:00']
+            if not midday.empty:
+                return float(midday.iloc[0]['VIX'])
+            return float(day_rows.iloc[0]['VIX'])
+    except Exception:
+        pass
+    return None
+
+
+# ── Direction analysis (point-in-time via stock_drop_pit) ────────────────────
+
+V2_RULES_FILE = os.path.join(ALERT_DIR, 'stock_drop_v2_rules.json')
+
+
+def load_v2_rules():
+    """Load the validated v2 rule set, or {} if not yet derived."""
+    try:
+        import json
+        with open(V2_RULES_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+_pit_analyzer = None
+
+
+def get_pit_analyzer(target_date):
+    """Shared PITAnalyzer refreshed through the alert date."""
+    global _pit_analyzer
+    if _pit_analyzer is None:
+        from stock_drop_pit import PITAnalyzer
+        _pit_analyzer = PITAnalyzer(refresh_through=target_date)
+    return _pit_analyzer
+
+
+def analyze_direction(symbol, target_date=None, earnings_weight=1.0,
+                      recency_half_life_months=None, lookback_months=None):
+    """
+    Determine call vs put from the point-in-time bounce stats: 5%+ drops in
+    the trailing lookback (live = 5 years) whose 10-day forward window has
+    closed, earnings drops down-weighted by earnings_weight. Recency decay
+    is off in the live standard (equal weight).
+    Returns dict with direction, avg_return, win_rate, num_drops, conviction,
+    plus cascade context, or None.
+    """
+    target_date = target_date or datetime.now().strftime('%Y-%m-%d')
+    pit = get_pit_analyzer(target_date)
+    kw = {'earnings_weight': earnings_weight}
+    if recency_half_life_months is not None:
+        kw['recency_half_life_months'] = recency_half_life_months
+    if lookback_months is not None:
+        kw['lookback_months'] = lookback_months
+    stats = pit.bounce_stats(symbol, target_date, **kw)
+    if not stats or stats['n_drops'] < MIN_HIST_DROPS:
+        return None
+    out = {
+        'direction': stats['direction'],
+        'avg_return': stats['wavg_return'],
+        'win_rate': stats['win_rate'],
+        'num_drops': stats['n_drops'],
+        'conviction': stats['conviction'],
+    }
+    out['is_earnings_drop'] = int(pit.is_earnings_drop(symbol, target_date))
+    out.update(pit.cascade_features(symbol, target_date))
+    # Drop-day volume (the target_date bar, NOT the last bar — they differ
+    # when regenerating a past date) for Day-1 volume-ratio at confirmation
+    out['drop_day_volume'] = None
+    daily = pit.get_daily(symbol)
+    if len(daily):
+        from stock_drop_pit import _to_date
+        row = daily[daily['date'] == _to_date(target_date)]
+        if len(row):
+            out['drop_day_volume'] = float(row['volume'].iloc[0])
+    return out
+
+
+# ── Polygon helpers ──────────────────────────────────────────────────────────
+
+def _polygon_get(url, params):
+    """GET with pacing for Polygon rate limits."""
+    global _last_polygon_ts
+    elapsed = time.time() - _last_polygon_ts
+    if elapsed < POLYGON_MIN_INTERVAL:
+        time.sleep(POLYGON_MIN_INTERVAL - elapsed)
+    try:
+        resp = requests.get(url, params=params, timeout=30)
+    except requests.RequestException:
+        return None
+    _last_polygon_ts = time.time()
+    if resp.status_code == 429:
+        time.sleep(2)
+        try:
+            resp = requests.get(url, params=params, timeout=30)
+        except requests.RequestException:
+            return None
+        _last_polygon_ts = time.time()
+    return resp
+
+
+def _get_option_day_volume(option_ticker, date_str):
+    """Get the trading volume for a specific option contract on a specific day
+    via Polygon aggregates endpoint. Returns volume (int) or 0."""
+    url = f'{POLYGON_BASE}/v2/aggs/ticker/{option_ticker}/range/1/day/{date_str}/{date_str}'
+    params = {'apiKey': POLYGON_API_KEY}
+    resp = _polygon_get(url, params)
+    if not resp or resp.status_code != 200:
+        return 0
+    try:
+        results = resp.json().get('results', [])
+        if results:
+            return int(results[0].get('v', 0))
+    except (ValueError, KeyError, IndexError):
+        pass
+    return 0
+
+
+def lookup_option_contract(symbol, price, direction, min_dte=None):
+    """
+    Look up real option contracts from Polygon and return the best match by
+    volume (follow the money) WITHIN ±25% of the stock price.
+
+    Finds the nearest monthly expiry at least min_dte (30) CALENDAR days out,
+    then ranks strikes inside the ±25% band by drop-day volume. The band is
+    the guardrail: liquidity picks the strike, but it can never drift to the
+    far-OTM lottery strikes that barely move (the unbounded version chased
+    50%+ OTM picks).
+
+    Returns dict with:
+      'strike', 'expiry', 'ticker', 'dte', 'volume' — highest-volume in band
+      'top_3' — top 3 in-band strikes by volume [{'strike','volume','ticker'}]
+    Or None if no contracts found.
+    """
+    if not POLYGON_API_KEY:
+        return None
+
+    if min_dte is None:
+        min_dte = MIN_DTE_CALENDAR
+
+    opt_type = direction.lower()
+    today = datetime.now().date()
+    min_expiry = today + timedelta(days=min_dte)
+    max_expiry = today + timedelta(days=120)
+
+    # Step 1: Get available contracts from reference endpoint (no strike bounds — volume decides)
+    url = f'{POLYGON_BASE}/v3/reference/options/contracts'
+    params = {
+        'underlying_ticker': symbol,
+        'contract_type': opt_type,
+        'expiration_date.gte': min_expiry.strftime('%Y-%m-%d'),
+        'expiration_date.lte': max_expiry.strftime('%Y-%m-%d'),
+        'expired': 'false',
+        'limit': 1000,
+        'apiKey': POLYGON_API_KEY,
+    }
+
+    resp = _polygon_get(url, params)
+    if not resp or resp.status_code != 200:
+        return None
+
+    try:
+        results = resp.json().get('results', [])
+    except ValueError:
+        return None
+
+    if not results:
+        return None
+
+    # Group by expiry, filter to monthly (3rd Friday) with 30+ calendar days DTE
+    by_expiry = {}
+    for c in results:
+        exp = c.get('expiration_date', '')
+        strike = float(c.get('strike_price', 0))
+        if exp and strike > 0:
+            try:
+                exp_date = datetime.strptime(exp, '%Y-%m-%d').date()
+            except ValueError:
+                continue
+            if _is_third_friday(exp_date):
+                by_expiry.setdefault(exp, []).append(c)
+
+    if not by_expiry:
+        return None
+
+    nearest_expiry = min(by_expiry.keys())
+    contracts = by_expiry[nearest_expiry]
+
+    exp_date = datetime.strptime(nearest_expiry, '%Y-%m-%d').date()
+    dte = (exp_date - today).days
+    today_str = today.strftime('%Y-%m-%d')
+
+    # Step 2: Rank in-band strikes by drop-day volume. The ±25% band keeps
+    # the pick from drifting too far OTM or ITM; inside it, liquidity decides
+    # (slightly ITM is fine — ITM still moves hard when the stock runs).
+    max_dist = 0.25 * price
+    contract_volumes = []
+    for c in contracts:
+        ticker = c.get('ticker', '')
+        strike = float(c.get('strike_price', 0))
+        if abs(strike - price) > max_dist:
+            continue
+        vol = _get_option_day_volume(ticker, today_str)
+        contract_volumes.append({
+            'strike': strike,
+            'volume': vol,
+            'ticker': ticker,
+        })
+
+    if not contract_volumes:
+        return None
+
+    # Sort by volume descending, proximity to price as tiebreaker
+    contract_volumes.sort(
+        key=lambda x: (-x['volume'], abs(x['strike'] - price))
+    )
+
+    best = contract_volumes[0]
+    return {
+        'strike': best['strike'],
+        'expiry': nearest_expiry,
+        'ticker': best['ticker'],
+        'dte': dte,
+        'volume': best['volume'],
+        'top_3': contract_volumes[:3],
+    }
+
+
+def get_options_volume(symbol):
+    """
+    Get total options volume for a symbol on the current day via Polygon
+    options snapshot. Sums day.volume across all contracts.
+    Returns total volume (int) or None if unavailable.
+    """
+    if not POLYGON_API_KEY:
+        return None
+
+    url = f'{POLYGON_BASE}/v3/snapshot/options/{symbol}'
+    all_volume = 0
+    params = {
+        'limit': 250,
+        'apiKey': POLYGON_API_KEY,
+    }
+
+    # Paginate through results
+    while True:
+        resp = _polygon_get(url, params)
+        if not resp or resp.status_code != 200:
+            return all_volume if all_volume > 0 else None
+
+        try:
+            data = resp.json()
+            results = data.get('results', [])
+        except ValueError:
+            break
+
+        for contract in results:
+            day_data = contract.get('day', {})
+            vol = day_data.get('volume', 0) or 0
+            all_volume += vol
+
+        # Check for next page
+        next_url = data.get('next_url')
+        if next_url and len(results) == 250:
+            url = next_url
+            params = {'apiKey': POLYGON_API_KEY}
+        else:
+            break
+
+    return all_volume
+
+
+# ── Filters ───────────────────────────────────────────────────────────────────
+
+def is_excluded(symbol):
+    """Check if symbol should be excluded."""
+    if any(symbol.upper().endswith(s) for s in EXCLUDED_SUFFIXES):
+        return True
+    if symbol in KNOWN_LEVERAGED:
+        return True
+    return False
+
+
+def get_tier_rules(drop_pct, vix):
+    """
+    Numbered-watchlist gate, then the 10-day exit.
+
+    Returns (tp, sl, label). tp is None when the 10-day book holds the
+    window. Returns None when the older VIX cap fails, so that name stays
+    off the numbered list and v2 decides at confirmation. A 5-6% drop at
+    VIX 20-29 is in that group. If v2 confirms it, confirmation stamps
+    +150%. Returns None when drop or VIX cannot be read.
+    """
+    result = standard_take_profit(drop_pct, vix, hold_days=10)
+    if result is None:
+        return None
+    tp, sl, label = result
+    if label.startswith('no tier') or numbered_watchlist_blocked(drop_pct, vix):
+        return None
+    return tp, sl, label
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+class TeeOutput:
+    """Write to both console and file."""
+    def __init__(self, filename):
+        self.terminal = sys.stdout
+        self.file = open(filename, 'w')
+
+    def write(self, message):
+        self.terminal.write(message)
+        self.file.write(message)
+
+    def flush(self):
+        self.terminal.flush()
+        self.file.flush()
+
+    def close(self):
+        self.file.close()
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Generate next-morning watchlist from stock drop alerts")
+    parser.add_argument('--date', type=str, default=None,
+                        help='Alert date to process (YYYY-MM-DD). Default: today.')
+    parser.add_argument('--vix-override', type=float, default=None,
+                        help='Override VIX value instead of fetching live.')
+    args = parser.parse_args()
+
+    target_date = args.date or datetime.now().strftime('%Y-%m-%d')
+
+    # Find alert file
+    alert_file = find_alert_file(target_date)
+    if not alert_file:
+        print(f"No alert file found for {target_date}")
+        sys.exit(1)
+
+    # Set up output
+    os.makedirs(ALERT_DIR, exist_ok=True)
+    output_file = os.path.join(ALERT_DIR, f'Stock_Drop_Watchlist_{target_date}.txt')
+    tee = TeeOutput(output_file)
+    sys.stdout = tee
+
+    try:
+        _run(target_date, alert_file, args.vix_override)
+    finally:
+        sys.stdout = tee.terminal
+        tee.close()
+        print(f"\nSaved to: {output_file}")
+
+
+def _run(target_date, alert_file, vix_override):
+    """Main watchlist generation logic."""
+    print("=" * 90)
+    print("STOCK DROP WATCHLIST — Next Morning Plays")
+    print(f"Alert Date: {target_date}")
+    print(f"Generated:  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("=" * 90)
+
+    # ── Parse drops ──
+    drops = parse_alert_file(alert_file)
+    if not drops:
+        print(f"\nNo qualifying drops found in {os.path.basename(alert_file)}")
+        return
+
+    # ── Basic filters: warrants, leveraged, market cap, stock price ──
+    filtered_basic = []
+    for d in drops:
+        if is_excluded(d['symbol']):
+            continue
+        if d['market_cap'] < MIN_MARKET_CAP:
+            filtered_basic.append((d['symbol'], f"Market cap ${d['market_cap']/1e6:.0f}M < ${MIN_MARKET_CAP/1e6:.0f}M"))
+            continue
+        if d['price'] < MIN_STOCK_PRICE:
+            filtered_basic.append((d['symbol'], f"Price ${d['price']:.2f} < ${MIN_STOCK_PRICE}"))
+            continue
+        drops = drops  # keep in list
+    drops = [d for d in drops
+             if not is_excluded(d['symbol'])
+             and d['market_cap'] >= MIN_MARKET_CAP
+             and d['price'] >= MIN_STOCK_PRICE]
+
+    if filtered_basic:
+        print(f"\n  Filtered (basic): {len(filtered_basic)} stocks")
+        for sym, reason in filtered_basic[:5]:
+            print(f"    ✗ {sym} — {reason}")
+        if len(filtered_basic) > 5:
+            print(f"    ... and {len(filtered_basic) - 5} more")
+
+    print(f"\nParsed {len(drops)} stocks with 5%+ drops (after basic filters)")
+
+    # ── Get VIX ──
+    if vix_override is not None:
+        vix = vix_override
+        vix_source = 'override'
+    else:
+        vix = get_vix_from_history(target_date)
+        if vix:
+            vix_source = 'history'
+        else:
+            vix = fetch_current_vix()
+            vix_source = 'live' if vix else None
+
+    if vix is None:
+        print("\n⚠ Could not determine VIX — cannot apply filters.")
+        return
+
+    # VIX regime
+    if vix < 15:
+        regime = 'LOW'
+    elif vix < 20:
+        regime = 'MODERATE'
+    elif vix < 25:
+        regime = 'ELEVATED'
+    elif vix < 30:
+        regime = 'HIGH'
+    else:
+        regime = 'EXTREME'
+
+    print(f"\nVIX: {vix:.1f} ({regime}) — source: {vix_source}")
+
+    print(f"\nTake-profit: replay table (10-day book). Stop: {STANDARD_SL_PCT}% "
+          f"on every name.")
+
+    # ── Apply tier filters ──
+    # With v2 rules present, the old static VIX caps no longer decide
+    # candidacy — the validated tier table is applied at confirmation time
+    # with the live VIX. Stocks the v0 rules would cut stay on the candidate
+    # list (marked v2-only) but are kept OUT of the numbered watchlist text,
+    # so the v0 paper book (PnL tracker) is unchanged.
+    v2_rules = load_v2_rules()
+    qualified = []
+    filtered_out = []
+
+    def _bucket_label(drop_pct):
+        a = abs(drop_pct)
+        for lo, hi, label in DROP_BUCKETS:
+            if lo <= a < hi:
+                return label
+        return f'{a:.0f}%'
+
+    for stock in drops:
+        drop_abs = abs(stock['drop_pct'])
+        result = get_tier_rules(stock['drop_pct'], vix)
+        if result is None:
+            if v2_rules:
+                preview = standard_take_profit(
+                    stock['drop_pct'], vix, hold_days=10)
+                stock['tp'] = preview[0] if preview else None
+                stock['sl'] = STANDARD_SL_PCT
+                stock['tier'] = f'{_bucket_label(stock["drop_pct"])} [v2-only]'
+                stock['tp_source'] = 'v2-only — exit if confirmed'
+                stock['v0_pass'] = False
+            else:
+                filtered_out.append((stock['symbol'], stock['drop_pct'],
+                                     f"VIX {vix:.0f} too high for {drop_abs:.0f}% drop"))
+                continue
+        else:
+            tp, sl, tier = result
+            stock['tp'] = tp
+            stock['sl'] = sl
+            stock['tier'] = tier
+            stock['tp_source'] = 'replay table' if tp else 'hold the window'
+            stock['v0_pass'] = True
+        qualified.append(stock)
+
+    if filtered_out:
+        print(f"\nFiltered out ({len(filtered_out)} stocks):")
+        for sym, dp, reason in filtered_out[:10]:
+            print(f"  ✗ {sym} ({dp:.1f}% drop) — {reason}")
+        if len(filtered_out) > 10:
+            print(f"  ... and {len(filtered_out) - 10} more")
+
+    if not qualified:
+        print("\nNo stocks qualify under current VIX regime.")
+        return
+
+    # Sort by market cap desc
+    qualified.sort(key=lambda x: x['market_cap'], reverse=True)
+
+    print(f"\n{len(qualified)} stocks qualify — analyzing direction + options...")
+
+    # ── Direction analysis + option lookup + quality filters ──
+    watchlist = []
+    skipped = {'no_history': [], 'low_wr': [], 'no_options': [], 'low_volume': []}
+
+    # Track how many times each symbol has appeared in recent alerts
+    # to detect repeat droppers
+    from glob import glob as _glob
+    recent_alerts = sorted(_glob(os.path.join(ALERT_DIR, 'Stock_Drop_Alert_*.txt')))[-30:]
+    drop_history_count = {}
+    for af in recent_alerts:
+        for s in parse_alert_file(af):
+            drop_history_count[s['symbol']] = drop_history_count.get(s['symbol'], 0) + 1
+
+    from stock_drop_pit import RECENCY_HALF_LIFE_MONTHS, LOOKBACK_MONTHS
+    earn_w = float(v2_rules.get('earnings_weight', 1.0))
+    if 'recency_half_life_months' in v2_rules:
+        rec_hl = float(v2_rules.get('recency_half_life_months'))
+    else:
+        rec_hl = float(v2_rules.get('recency_half_life_years',
+                                    RECENCY_HALF_LIFE_MONTHS / 12)) * 12.0
+    lookback_m = float(v2_rules.get('lookback_months', LOOKBACK_MONTHS))
+    if v2_rules:
+        print(f"  [v2] rules loaded ({v2_rules.get('derived', '?')}), "
+              f"earnings weight {earn_w}, lookback {lookback_m:g}mo, "
+              f"recency half-life {rec_hl:g}mo")
+
+    for stock in qualified:
+        symbol = stock['symbol']
+        print(f"  {symbol}...", end='', flush=True)
+
+        # Step 1: Determine direction from point-in-time bounce stats
+        #   - Weighted avg 10D forward return after closed-window 5%+ drops
+        #   - Positive → Call (tends to bounce), Negative → Put (keeps dropping)
+        #   - Trailing lookback (live 5 years, equal weight)
+        #   - Earnings drops down-weighted per validated v2 rules
+        #   - Need at least MIN_HIST_DROPS closed windows in that lookback
+        info = analyze_direction(symbol, target_date=target_date,
+                                 earnings_weight=earn_w,
+                                 recency_half_life_months=rec_hl,
+                                 lookback_months=lookback_m)
+        if not info:
+            print(f" ✗ insufficient drop history "
+                  f"(<{MIN_HIST_DROPS} closed drops in {lookback_m:g}mo)")
+            skipped['no_history'].append(symbol)
+            continue
+
+        stock['direction'] = info['direction']
+        stock['avg_return'] = info['avg_return']
+        stock['win_rate'] = info['win_rate']
+        stock['hist_drops'] = info['num_drops']
+        stock['conviction'] = info.get('conviction')
+        stock['is_earnings_drop'] = info.get('is_earnings_drop', 0)
+        stock['consec_down_days'] = info.get('consec_down_days')
+        stock['pct_below_20d_high'] = info.get('pct_below_20d_high')
+        stock['ret_5d_pct'] = info.get('ret_5d_pct')
+        stock['drop_day_volume'] = info.get('drop_day_volume')
+
+        # Win rate is informational. The live stop stays at -40%.
+        wr = info['win_rate']
+        wr_tag = ' [low WR]' if wr < MIN_HIST_WIN_RATE else ''
+
+        print(f" → {info['direction']} (avg {info['avg_return']:+.1f}%, "
+              f"WR: {wr:.0f}%, {info['num_drops']} drops){wr_tag}", end='')
+
+        # Step 3: Check options volume on the drop day
+        opt_vol = get_options_volume(symbol)
+        if opt_vol is not None and opt_vol < MIN_OPTIONS_VOLUME:
+            print(f" ✗ options vol {opt_vol:,} < {MIN_OPTIONS_VOLUME:,}")
+            skipped['low_volume'].append(f"{symbol} (vol:{opt_vol:,})")
+            continue
+        stock['options_volume'] = opt_vol
+
+        # Step 4: Look up real option contract from Polygon
+        #   - Nearest monthly expiry at least MIN_DTE_CALENDAR calendar days out
+        #   - Highest-volume strike within ±25% of spot
+        #   - No contracts = skip
+        contract = lookup_option_contract(
+            symbol, stock['price'], stock['direction']
+        )
+        if not contract:
+            print(f" ✗ no options (or none with {MIN_DTE_CALENDAR}+ calendar days DTE)")
+            skipped['no_options'].append(symbol)
+            continue
+
+        # Skip if even the chosen contract is too thin to fill reliably
+        best_vol = contract.get('volume', 0)
+        if best_vol < MIN_CONTRACT_VOLUME:
+            print(f" ✗ chosen contract vol {best_vol} < {MIN_CONTRACT_VOLUME}")
+            skipped['low_volume'].append(f"{symbol} (chosen contract vol:{best_vol})")
+            continue
+
+        stock['real_strike'] = contract['strike']
+        stock['real_expiry'] = contract['expiry']
+        stock['option_ticker'] = contract['ticker']
+        stock['dte'] = contract['dte']
+        stock['top_3_strikes'] = contract.get('top_3', [])
+
+        # Step 5: Flag repeat droppers (informational, not a hard gate)
+        recent_count = drop_history_count.get(symbol, 1)
+        stock['recent_drop_count'] = recent_count
+        stock['is_repeat_dropper'] = recent_count >= REPEAT_DROP_WARN
+
+        count_str = f" [{recent_count}x in 30d]" if recent_count >= REPEAT_DROP_WARN else ""
+        print(f" | ${contract['strike']:.2f} exp {contract['expiry']} "
+              f"({contract['dte']}d){count_str}")
+
+        stock['sl_pre_wr'] = stock['sl']
+
+        watchlist.append(stock)
+
+    # Report what was filtered
+    if skipped['no_history']:
+        print(f"\n  Skipped (no drop history): {', '.join(skipped['no_history'])}")
+    if skipped['low_volume']:
+        print(f"  Skipped (low volume — underlying <{MIN_OPTIONS_VOLUME:,} or best contract <{MIN_CONTRACT_VOLUME}): {', '.join(skipped['low_volume'])}")
+    if skipped['no_options']:
+        print(f"  Skipped (no options/{MIN_DTE_CALENDAR}+ calendar days DTE): {', '.join(skipped['no_options'])}")
+
+    if not watchlist:
+        print("\nNo stocks with options qualify today.")
+        return
+
+    # ── Rank watchlist ──
+    # Priority: higher avg_return, higher win_rate, bigger drop
+    watchlist.sort(key=lambda x: (x['avg_return'], x['win_rate'], abs(x['drop_pct'])),
+                   reverse=True)
+
+    # ── Emit machine-readable candidates CSV (consumed by the confirmation
+    #    entry script the next session) ──
+    candidates_file = os.path.join(ALERT_DIR, f'Stock_Drop_Candidates_{target_date}.csv')
+    try:
+        import csv as _csv
+        with open(candidates_file, 'w', newline='') as cf:
+            w = _csv.writer(cf)
+            w.writerow(['Symbol', 'Direction', 'Drop_Pct', 'Drop_Close',
+                        'Market_Cap', 'Tier', 'TP', 'SL', 'TP_Conservative',
+                        'TP_Aggressive', 'TP_Source', 'Strike', 'Expiry',
+                        'Option_Ticker', 'DTE', 'Options_Volume',
+                        'Top3_Strikes',
+                        'PIT_WAvg', 'PIT_WR', 'PIT_Conviction', 'PIT_N_Drops',
+                        'Is_Earnings_Drop', 'Consec_Down_Days',
+                        'Pct_Below_20d_High', 'Ret_5d_Pct', 'Drop_Day_Volume',
+                        'VIX_At_Drop'])
+            for s in watchlist:
+                top3_str = ';'.join(
+                    f"{t['strike']:g}:{int(t['volume'] or 0)}"
+                    for t in (s.get('top_3_strikes') or []))
+                w.writerow([
+                    s['symbol'], s['direction'], s['drop_pct'], s['price'],
+                    s['market_cap'], s['tier'], s['tp'],
+                    s.get('sl_pre_wr', s['sl']),
+                    s.get('tp_conservative'), s.get('tp_aggressive'),
+                    s.get('tp_source'), s.get('real_strike'),
+                    s.get('real_expiry'), s.get('option_ticker'),
+                    s.get('dte'), s.get('options_volume'),
+                    top3_str,
+                    round(s.get('avg_return', 0), 3),
+                    round(s.get('win_rate', 0), 1),
+                    round(s.get('conviction') or 0, 3), s.get('hist_drops'),
+                    s.get('is_earnings_drop', 0), s.get('consec_down_days'),
+                    s.get('pct_below_20d_high'), s.get('ret_5d_pct'),
+                    s.get('drop_day_volume'), round(vix, 2),
+                ])
+        print(f"\nCandidates CSV: {candidates_file}")
+    except Exception as e:
+        print(f"\n⚠ Could not write candidates CSV: {e}")
+
+    # ── Output watchlist ──
+    print("\n\n" + "=" * 90)
+    print("CANDIDATES — PENDING DAY-1 CONFIRMATION")
+    print("Entry is decided TOMORROW ~12:45 PM PST by stock_drop_confirmation_entry.py:")
+    print("  calls need a GREEN Day 1 (close > open), puts pass; top picks by score, max 15.")
+    print("=" * 90)
+    print(f"VIX: {vix:.1f} ({regime})")
+    print()
+
+    v2_only = [s for s in watchlist if not s.get('v0_pass', True)]
+    numbered = [s for s in watchlist if s.get('v0_pass', True)]
+    if v2_only:
+        print(f"v2-only candidates (cut by old VIX rules; tier decided at "
+              f"confirmation): {', '.join(s['symbol'] for s in v2_only)}")
+        print()
+
+    for rank, stock in enumerate(numbered, 1):
+        symbol = stock['symbol']
+        drop = stock['drop_pct']
+        price = stock['price']
+        direction = stock['direction']
+        tp = stock['tp']
+        sl = stock['sl']
+        tier = stock['tier']
+        avg_ret = stock.get('avg_return', 0)
+        wr = stock.get('win_rate', 0)
+        hist = stock.get('hist_drops', 0)
+
+        cap = stock['market_cap']
+        if cap >= 1e12:
+            cap_str = f"${cap / 1e12:.1f}T"
+        elif cap >= 1e9:
+            cap_str = f"${cap / 1e9:.1f}B"
+        else:
+            cap_str = f"${cap / 1e6:.0f}M"
+
+        tp_str = f"+{tp}%" if tp else "Hold to D10"
+
+        # Real contract info
+        real_strike = stock.get('real_strike')
+        real_expiry = stock.get('real_expiry')
+        opt_ticker = stock.get('option_ticker')
+
+        expiry_str = real_expiry
+        dte = stock.get('dte', 0)
+        top_3 = stock.get('top_3_strikes', [])
+
+        print(f"  {rank}. {symbol} {direction} — {drop:.1f}% drop @ ${price:.2f} ({cap_str})")
+        print(f"     Tier: {tier}")
+        tp_src = stock.get('tp_source', 'tier')
+        print(f"     TP: {tp_str}  |  SL: {sl}%  |  Hold: 10 trading days max  [{tp_src}]")
+        std20 = standard_take_profit(drop, vix, hold_days=20)
+        if std20 and std20[0] != tp:
+            tp20 = std20[0]
+            tp20_str = f"+{tp20}%" if tp20 else "Hold to D20"
+            print(f"     3-month book (20d): TP {tp20_str}  |  SL: {std20[1]}%  |  "
+                  f"Hold: 20 trading days")
+        opt_vol = stock.get('options_volume')
+        vol_str = f"  |  Opt Vol: {opt_vol:,}" if opt_vol else ""
+        print(f"     Expiry: {expiry_str} ({dte} DTE)")
+        if top_3:
+            print(f"     Strikes by volume (within ±25% of spot):")
+            for i, s in enumerate(top_3, 1):
+                marker = " ← BEST" if i == 1 else ""
+                vol_display = f"{s['volume']:,}" if s['volume'] else "0"
+                print(f"       {i}. ${s['strike']:.2f}  (vol: {vol_display}){marker}")
+            if opt_ticker:
+                print(f"     Ticker: {opt_ticker}")
+        else:
+            print(f"     Strike: ${real_strike:.2f}  |  Ticker: {opt_ticker}" if opt_ticker else f"     Strike: ${real_strike:.2f}")
+        print(f"     History: {hist} closed drops in 5yr, avg 10D return: {avg_ret:+.1f}%, WR: {wr:.0f}%{vol_str}")
+
+        # Risk warnings
+        warnings = []
+        if abs(drop) >= 15:
+            warnings.append("Extreme drop — higher risk of continued decline")
+        if vix >= 25:
+            warnings.append(f"VIX elevated ({vix:.0f}) — premiums are expensive")
+        if stock.get('is_repeat_dropper'):
+            cnt = stock.get('recent_drop_count', 0)
+            warnings.append(f"Repeat dropper ({cnt}x in 30d) — lower confidence")
+        if warnings:
+            print(f"     ⚠ {' | '.join(warnings)}")
+        print()
+
+    # ── Quick reference table ──
+    print("-" * 90)
+    print("QUICK REFERENCE:")
+    print("-" * 90)
+
+    table = []
+    for rank, stock in enumerate(numbered, 1):
+        tp = stock['tp']
+        tp_str = f"+{tp}%" if tp else "D10"
+        rs = stock.get('real_strike')
+        re_ = stock.get('real_expiry')
+        dte = stock.get('dte', 0)
+        repeat = f" *" if stock.get('is_repeat_dropper') else ""
+        table.append([
+            rank,
+            stock['symbol'] + repeat,
+            stock['direction'],
+            f"{stock['drop_pct']:.1f}%",
+            f"${stock['price']:.2f}",
+            f"${rs:.2f}" if rs else "N/A",
+            re_ if re_ else "N/A",
+            dte,
+            f"{stock.get('avg_return', 0):+.1f}%",
+            f"{stock.get('win_rate', 0):.0f}%",
+            tp_str,
+            f"{stock['sl']}%",
+        ])
+
+    print(tabulate(table, headers=[
+        '#', 'Symbol', 'Dir', 'Drop', 'Price', 'Strike', 'Expiry',
+        'DTE', 'Avg 10D', 'WR', 'TP', 'SL'
+    ], tablefmt='simple', numalign='right'))
+    split = []
+    for stock in numbered:
+        std20 = standard_take_profit(stock['drop_pct'], vix, hold_days=20)
+        if std20 and std20[0] != stock.get('tp'):
+            tp20 = f"+{std20[0]}%" if std20[0] else "Hold D20"
+            split.append(f"{stock['symbol']} {tp20}")
+    if split:
+        print("  3-month 20-day target differs from this 10-day sheet: "
+              + ", ".join(split))
+    if any(s.get('is_repeat_dropper') for s in watchlist):
+        print("  * = repeat dropper (3+ drops in last 30 days)")
+
+    print(f"\n{'=' * 90}")
+    print("RULES REMINDER (v2 — confirmation entry):")
+    print("  • These are CANDIDATES, not entries. Do NOT enter at the open.")
+    print("  • Tomorrow ~12:45 PM PST the confirmation script checks Day-1 action:")
+    print("      calls: enter near the close only if the day is GREEN (close > open)")
+    print("      puts:  enter near the close (no condition)")
+    print("  • Survivors are scored and capped at 15; weak scores are dropped entirely")
+    print(f"  • Current VIX regime: {regime} — {'full sizing' if vix < 20 else 'reduced sizing recommended'}")
+    print(f"\nFILTERS APPLIED:")
+    print(f"  Market cap >= ${MIN_MARKET_CAP/1e6:.0f}M  |  Stock price >= ${MIN_STOCK_PRICE}")
+    print(f"  Historical WR >= {MIN_HIST_WIN_RATE}%  |  DTE >= {MIN_DTE_CALENDAR} calendar days")
+    print(f"  Options volume >= {MIN_OPTIONS_VOLUME:,} contracts  |  "
+          f"Min {MIN_HIST_DROPS} closed drops in 5yr history")
+    print("=" * 90)
+
+    # ── iOS Reminders (monthly list decommissioned) ──
+    # Candidate-summary reminders to "Stocks/Options To Look At" are off.
+    # Live actionable ENTER alerts now come only from the 3-month book
+    # ("3 Month Options") via stock_drop_confirmation_entry.py @ 12:45 PT.
+    # create_reminders(watchlist, target_date, vix)  # disabled
+    print("\nReminders: monthly candidate summary skipped "
+          "(decommissioned — use 3 Month Options ENTER list at 12:45 PT)")
+
+
+REMINDERS_LIST = 'Stocks/Options To Look At'
+REMINDERS_STATE = os.path.join(ALERT_DIR, '.reminders_created.json')
+
+
+def _load_reminder_state():
+    try:
+        import json
+        with open(REMINDERS_STATE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_reminder_state(state):
+    try:
+        import json
+        with open(REMINDERS_STATE, 'w') as f:
+            json.dump(state, f, indent=2)
+    except Exception:
+        pass
+
+
+def create_reminders(watchlist, target_date, vix):
+    """DEPRECATED — monthly Reminders list decommissioned.
+
+    Kept for manual/debug use only. Production no longer calls this.
+    Actionable entries go to "3 Month Options" from confirmation_entry.
+    """
+    print("\nReminders: create_reminders() is deprecated "
+          "(monthly list decommissioned).")
+    if not watchlist:
+        return
+
+    # Parse target_date to get the next trading session for the reminder
+    from market_holidays import is_market_holiday
+    dt = datetime.strptime(target_date, '%Y-%m-%d')
+    next_day = dt + timedelta(days=1)
+    while next_day.weekday() >= 5 or is_market_holiday(next_day.strftime('%Y-%m-%d')):
+        next_day += timedelta(days=1)
+    remind_date = next_day.strftime('%Y-%m-%d')
+
+    state = _load_reminder_state()
+    state_key = f'{target_date}|__summary__'
+    if state_key in state:
+        print(f"\nReminders: candidate summary for {target_date} already "
+              f"created — skipped (no duplicates)")
+        return
+
+    cand_lines = []
+    for stock in watchlist:
+        strike = stock.get('real_strike')
+        strike_str = f"${strike:g}" if strike else '?'
+        expiry = stock.get('real_expiry') or '?'
+        cand_lines.append(
+            f"{stock['symbol']} {stock['direction']} {strike_str} exp {expiry}"
+            f" ({stock['drop_pct']:.1f}% @ ${stock['price']:.2f})")
+
+    title = (f"Stock drop candidates ({len(watchlist)}) — "
+             f"confirmation 12:45 PM {remind_date}")
+    body = (
+        f"PENDING Day-1 confirmation — do NOT enter at open.\\n"
+        f"Confirmed entries get their own ENTER reminders ~12:45 PM PST.\\n"
+        f"VIX at drop: {vix:.1f}\\n\\n"
+        + "\\n".join(cand_lines)
+    )
+
+    # osascript is invoked without a shell — escape only for the
+    # AppleScript double-quoted literal (body keeps intentional \n).
+    title_esc = title.replace('\\', '\\\\').replace('"', '\\"')
+    body_esc = body.replace('"', '\\"')
+
+    script = (
+        'tell application "Reminders"\n'
+        f'  tell list "{REMINDERS_LIST}"\n'
+        f'    set dueDate to current date\n'
+        f'    set day of dueDate to 1\n'
+        f'    set year of dueDate to {next_day.year}\n'
+        f'    set month of dueDate to {next_day.month}\n'
+        f'    set day of dueDate to {next_day.day}\n'
+        f'    set hours of dueDate to 12\n'
+        f'    set minutes of dueDate to 30\n'
+        f'    set seconds of dueDate to 0\n'
+        f'    make new reminder with properties '
+        f'{{name:"{title_esc}", body:"{body_esc}", '
+        f'due date:dueDate, remind me date:dueDate}}\n'
+        f'  end tell\n'
+        f'end tell\n'
+    )
+
+    created = False
+    try:
+        result = subprocess.run(
+            ['osascript', '-e', script],
+            capture_output=True, text=True, timeout=10
+        )
+        created = result.returncode == 0
+    except Exception:
+        pass
+
+    if created:
+        state[state_key] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        _save_reminder_state(state)
+    print(f"\nReminders: {'created 1 candidate-summary reminder' if created else 'creation FAILED'} "
+          f"in '{REMINDERS_LIST}' ({len(watchlist)} candidates listed)")
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,333 @@
+{
+  "derived": "2026-06-10 12:46",
+  "train_cutoff": "2024-12-31",
+  "source_backtest": "Stock_Drop_Options_Backtest_2026-06-05.csv",
+  "earnings_weight": 1.0,
+  "lookback_months": 60,
+  "recency_half_life_months": 0.0,
+  "min_pit_drops": 5,
+  "gate": {
+    "calls": "d1_close > d1_open",
+    "puts": "none",
+    "entry": "day1 close"
+  },
+  "tier_table": {
+    "5-6%|VIX<20": {
+      "tradable": true,
+      "tp": null,
+      "sl": -30,
+      "train_n": 238,
+      "train_ev": 0.108,
+      "reason": "ok"
+    },
+    "5-6%|VIX20-25": {
+      "tradable": true,
+      "tp": null,
+      "sl": -30,
+      "train_n": 44,
+      "train_ev": 0.4223,
+      "reason": "ok"
+    },
+    "5-6%|VIX25-30": {
+      "tradable": false,
+      "tp": null,
+      "sl": null,
+      "train_n": 9,
+      "train_ev": null,
+      "reason": "N<30"
+    },
+    "5-6%|VIX30+": {
+      "tradable": false,
+      "tp": null,
+      "sl": null,
+      "train_n": 5,
+      "train_ev": null,
+      "reason": "N<30"
+    },
+    "6-8%|VIX<20": {
+      "tradable": true,
+      "tp": null,
+      "sl": -40,
+      "train_n": 223,
+      "train_ev": 0.0851,
+      "reason": "ok"
+    },
+    "6-8%|VIX20-25": {
+      "tradable": false,
+      "tp": 150,
+      "sl": -25,
+      "train_n": 53,
+      "train_ev": -0.0119,
+      "reason": "train EV<=0"
+    },
+    "6-8%|VIX25-30": {
+      "tradable": false,
+      "tp": null,
+      "sl": null,
+      "train_n": 11,
+      "train_ev": null,
+      "reason": "N<30"
+    },
+    "6-8%|VIX30+": {
+      "tradable": false,
+      "tp": null,
+      "sl": null,
+      "train_n": 4,
+      "train_ev": null,
+      "reason": "N<30"
+    },
+    "8-10%|VIX<20": {
+      "tradable": true,
+      "tp": null,
+      "sl": -40,
+      "train_n": 76,
+      "train_ev": 0.5574,
+      "reason": "ok"
+    },
+    "8-10%|VIX20-25": {
+      "tradable": false,
+      "tp": null,
+      "sl": null,
+      "train_n": 25,
+      "train_ev": null,
+      "reason": "N<30"
+    },
+    "8-10%|VIX25-30": {
+      "tradable": false,
+      "tp": null,
+      "sl": null,
+      "train_n": 4,
+      "train_ev": null,
+      "reason": "N<30"
+    },
+    "8-10%|VIX30+": {
+      "tradable": false,
+      "tp": null,
+      "sl": null,
+      "train_n": 2,
+      "train_ev": null,
+      "reason": "N<30"
+    },
+    "10-15%|VIX<20": {
+      "tradable": true,
+      "tp": 150,
+      "sl": -30,
+      "train_n": 65,
+      "train_ev": 0.147,
+      "reason": "ok"
+    },
+    "10-15%|VIX20-25": {
+      "tradable": false,
+      "tp": null,
+      "sl": null,
+      "train_n": 11,
+      "train_ev": null,
+      "reason": "N<30"
+    },
+    "10-15%|VIX25-30": {
+      "tradable": false,
+      "tp": null,
+      "sl": null,
+      "train_n": 2,
+      "train_ev": null,
+      "reason": "N<30"
+    },
+    "10-15%|VIX30+": {
+      "tradable": false,
+      "tp": null,
+      "sl": null,
+      "train_n": 0,
+      "train_ev": null,
+      "reason": "N<30"
+    },
+    "15%+|VIX<20": {
+      "tradable": true,
+      "tp": null,
+      "sl": -25,
+      "train_n": 33,
+      "train_ev": 0.3849,
+      "reason": "ok"
+    },
+    "15%+|VIX20-25": {
+      "tradable": false,
+      "tp": null,
+      "sl": null,
+      "train_n": 8,
+      "train_ev": null,
+      "reason": "N<30"
+    },
+    "15%+|VIX25-30": {
+      "tradable": false,
+      "tp": null,
+      "sl": null,
+      "train_n": 0,
+      "train_ev": null,
+      "reason": "N<30"
+    },
+    "15%+|VIX30+": {
+      "tradable": false,
+      "tp": null,
+      "sl": null,
+      "train_n": 1,
+      "train_ev": null,
+      "reason": "N<30"
+    }
+  },
+  "score_features": [
+    {
+      "col": "prior_avg_shrunk",
+      "label": "Prior option-trade record (shrunk avg)",
+      "orientation": 1,
+      "train_deciles": [
+        -13.817767664847981,
+        3.523189099610566,
+        9.110387282878994,
+        10.77705394954566,
+        18.932464739454794,
+        18.932464739454794,
+        18.932464739454794,
+        18.932464739454794,
+        18.932464739454794,
+        18.932464739454794,
+        250.90414148056297
+      ]
+    },
+    {
+      "col": "pit_wr",
+      "label": "PIT historical bounce win rate",
+      "orientation": -1,
+      "train_deciles": [
+        27.3,
+        44.4,
+        47.2,
+        50.0,
+        51.8,
+        53.4,
+        55.64,
+        58.5,
+        62.220000000000006,
+        66.7,
+        88.9
+      ]
+    },
+    {
+      "col": "dvix",
+      "label": "VIX change drop day -> entry day",
+      "orientation": 1,
+      "train_deciles": [
+        -4.91,
+        -0.85,
+        -0.75,
+        -0.44,
+        -0.29,
+        -0.16,
+        0.08,
+        0.23,
+        0.45600000000000135,
+        1.11,
+        5.32
+      ]
+    },
+    {
+      "col": "consec_down_days",
+      "label": "Consecutive down days into drop",
+      "orientation": 1,
+      "train_deciles": [
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        2.0,
+        2.0,
+        2.0,
+        3.0,
+        11.0
+      ]
+    },
+    {
+      "col": "pct_below_20d_high",
+      "label": "Depth below 20d high at drop",
+      "orientation": 1,
+      "train_deciles": [
+        -63.33469055374592,
+        -27.387496027141097,
+        -22.489899895169653,
+        -18.403044605004435,
+        -15.516149509137625,
+        -13.15556158205078,
+        -11.290595866843574,
+        -9.366014170161638,
+        -7.725022820921887,
+        -6.217019378746935,
+        -5.006284038542108
+      ]
+    },
+    {
+      "col": "d1_ret_pct",
+      "label": "Day-1 move size",
+      "orientation": 1,
+      "train_deciles": [
+        -14.748201438848907,
+        0.18854565163610407,
+        0.5129780039861536,
+        0.9151430113329684,
+        1.3702490936732483,
+        1.9363360065140993,
+        2.56097319887178,
+        3.1702695454525487,
+        4.156350221434848,
+        6.422439798578148,
+        25.64102564102565
+      ]
+    },
+    {
+      "col": "d1_close_loc",
+      "label": "Day-1 close location in range",
+      "orientation": 1,
+      "train_deciles": [
+        0.0144462279293745,
+        0.370454338095225,
+        0.49445353700672845,
+        0.5847712818677389,
+        0.6644692554871734,
+        0.7472248886263508,
+        0.8090355722880967,
+        0.8607414229795072,
+        0.9040996199563358,
+        0.9535696295278628,
+        1.0
+      ]
+    },
+    {
+      "col": "d1_reclaim",
+      "label": "Day-1 close reclaimed drop close",
+      "orientation": 1,
+      "train_deciles": [
+        0.0,
+        0.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0
+      ]
+    }
+  ],
+  "score_floor": null,
+  "cap_per_day": 15,
+  "shrink_k": 5,
+  "pool_avg": 18.932464739454794,
+  "test_performance": {
+    "N": 1755,
+    "WR": 19.886039886039885,
+    "Avg": 12.314615155565532,
+    "EV": 0.12314615155565532,
+    "Cum": 21612.14959801751
+  }
+}

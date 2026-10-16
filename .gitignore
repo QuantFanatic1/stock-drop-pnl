@@ -1,0 +1,56 @@
+# Private research folder. Ignore everything, then allow the stock-drop
+# P&L publish set below. Do not switch this to "ignore secrets only"
+# and then run `git add .` — the rest of this directory is not for git.
+
+*
+
+# --- Publish set: code that fills and updates the P&L books ---
+!.gitignore
+!.env.example
+!README.md
+!requirements-stock-drop.txt
+!market_holidays.py
+!stock_drop_alert.py
+!stock_drop_watchlist.py
+!stock_drop_confirmation_entry.py
+!stock_drop_exit_rules.py
+!stock_drop_pit.py
+!stock_drop_pnl_tracker.py
+!stock_drop_3m_pnl_tracker.py
+!run_stock_drop_pnl.sh
+!run_stock_drop_confirmation.sh
+
+# Rules the confirmation step reads. Nothing else under this folder.
+!Stock_Drop_Alert/
+Stock_Drop_Alert/*
+!Stock_Drop_Alert/stock_drop_v2_rules.json
+
+# --- Secrets and local config. These stay ignored even if the
+#     allowlist above is widened later. ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*credentials*
+*secret*
+id_rsa
+id_ed25519
+
+# --- Local runtime junk ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.DS_Store
+*.log
+*.db
+*.sqlite
+*.sqlite3
+*.pkl
+*.pickle
+
+# Machine schedulers. The plists in this folder contain absolute home paths.
+*.plist
