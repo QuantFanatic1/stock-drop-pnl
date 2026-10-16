@@ -21,6 +21,7 @@
 !run_stock_drop_confirmation.sh
 !stock_drop_errors.py
 !vix_history.csv
+!paper_results_filled.csv
 !LICENSE
 !tests/
 !tests/test_exit_rules.py

@@ -36,7 +36,7 @@ These files ship with the repo. The signal uses them, and a missing file is repo
 
 - `vix_history.csv` — midday VIX used when a historical alert date is replayed
 - `Stock_Drop_Alert/stock_drop_v2_rules.json` — which cells are tradable, plus the score floor and daily cap
-- `Stock_Drop_Alert/Stock_Drop_Strategy_Results_2026-10-05.csv` — prior option results used in the confirmation score
+- `Stock_Drop_Alert/Stock_Drop_Strategy_Results_2026-10-05.csv` — 7,330 settled option outcomes from a backtest run, used only as each symbol's prior record in the confirmation score. The backtest code that produced the file is not in this repo.
 
 Generated paper books, alert archives, and logs stay out of git. See `.gitignore`.
 
@@ -44,15 +44,17 @@ Generated paper books, alert archives, and logs stay out of git. See `.gitignore
 
 Filled closed trades only. A row counts as filled when the option traded enough volume to enter. Open trades and no-fills are excluded. A win is an exit P&L above $0. Average return is the mean option-premium percent.
 
-Marked through 2026-10-15.
+Main book marked through 2026-10-16. The two 3-month books were last marked on 2026-10-15.
 
 | Book | Filled trades | Win rate | Average return | Average P&L |
 |---|---:|---:|---:|---:|
-| Main, 10-day hold (entries 2026-03-24 to 2026-10-13) | 739 | 35.7% | +8.7% | +$232 |
+| Main, 10-day hold (entries 2026-03-24 to 2026-10-15) | 746 | 35.4% | +8.3% | +$224 |
 | 3-month, 10-day hold (entries 2026-07-14 to 2026-10-13) | 189 | 36.5% | −7.0% | −$148 |
 | 3-month, 20-day hold (entries 2026-07-14 to 2026-10-13) | 184 | 29.3% | −10.3% | −$368 |
 
 On the main book the median filled trade is the −40% stop. The average is higher because the winners are larger than the losers. These are paper marks, not broker fills.
+
+The filled trades behind this table are in `paper_results_filled.csv` (1,119 rows: 746 + 189 + 184). Count the rows in a book, the share with `exit_pnl` above 0, and the mean of `exit_pnl_pct`. The averages above are that mean, rounded to one decimal for the percent and to the nearest dollar.
 
 ## Daily run
 
