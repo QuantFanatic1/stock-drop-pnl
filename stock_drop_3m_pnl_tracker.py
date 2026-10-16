@@ -1305,8 +1305,8 @@ def main():
         print("Weekend — use --force to rebuild/update, or --summary / --compare.")
         return
 
-    if not POLYGON_API_KEY:
-        print("POLYGON_API_KEY not set in .env")
+    if needs_market and not POLYGON_API_KEY:
+        print("POLYGON_API_KEY is not set. Copy .env.example to .env and add it.")
         return
 
     print("=" * 60)

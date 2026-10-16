@@ -15,6 +15,8 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from tabulate import tabulate
 
+from stock_drop_errors import public_error, require_env
+
 # Load environment variables
 load_dotenv()
 
@@ -97,7 +99,7 @@ def fmp_get_json(url, *, timeout=None, context="FMP request"):
 
             return data
         except requests.RequestException as exc:
-            print(f"  FMP error during {context}: {exc}. Waiting 15 seconds before retrying...")
+            print(f"  FMP error during {context}: {public_error(exc)}. Waiting 15 seconds before retrying...")
             time.sleep(FMP_RETRY_DELAY_SECONDS)
 
 
@@ -304,8 +306,8 @@ def check_stock_drop_on_date(symbol, target_date, start_date, end_date):
                             "price": day["close"],
                         }
                 break
-    except Exception:
-        pass
+    except (KeyError, TypeError, ValueError) as exc:
+        print(f"  Could not check {symbol} on {target_date}: {public_error(exc)}")
     return None
 
 
@@ -359,6 +361,7 @@ def main():
     parser.add_argument("-d", "--date", type=str,
                         help="Specific date to analyze (YYYY-MM-DD format). If not provided, uses today's data.")
     args = parser.parse_args()
+    require_env('FMP_API_KEY')
 
     if args.date:
         try:

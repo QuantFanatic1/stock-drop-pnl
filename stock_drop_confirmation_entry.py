@@ -49,6 +49,7 @@ import requests
 from dotenv import load_dotenv
 from tabulate import tabulate
 
+from stock_drop_errors import public_error, require_env
 from market_holidays import is_market_holiday
 from stock_drop_exit_rules import STANDARD_SL_PCT, standard_take_profit
 from stock_drop_pit import pit_trade_record
@@ -124,9 +125,9 @@ def fetch_quotes(symbols):
                 for q in resp.json():
                     out[q.get('symbol')] = q
                 break
-            except Exception as e:
+            except (requests.RequestException, ValueError, TypeError) as e:
                 print(f'  ⚠ quote fetch attempt {attempt}/{QUOTE_RETRIES} failed '
-                      f'({chunk[0]}..): {e}')
+                      f'({chunk[0]}..): {public_error(e)}')
                 if attempt < QUOTE_RETRIES:
                     import time
                     time.sleep(QUOTE_RETRY_PAUSE)
@@ -141,7 +142,12 @@ def fetch_vix():
             data = resp.json()
             if isinstance(data, list) and data:
                 return float(data[0].get('price') or 0) or None
-        except Exception:
+            print(f'  ⚠ VIX quote attempt {attempt}/{QUOTE_RETRIES} returned no price.')
+            if attempt < QUOTE_RETRIES:
+                import time
+                time.sleep(QUOTE_RETRY_PAUSE)
+        except (requests.RequestException, ValueError, TypeError) as exc:
+            print(f'  ⚠ VIX quote attempt {attempt}/{QUOTE_RETRIES} failed: {public_error(exc)}')
             if attempt < QUOTE_RETRIES:
                 import time
                 time.sleep(QUOTE_RETRY_PAUSE)
@@ -164,11 +170,15 @@ def load_prior_records():
         if m:
             candidates.append((m.group(1), f))
     if not candidates:
+        print("No Stock_Drop_Strategy_Results_YYYY-MM-DD.csv in Stock_Drop_Alert. "
+              "Prior-trade scores will use the pool average only. "
+              "The latest results file is part of this repo.")
         return {}
     candidates.sort(reverse=True)
     try:
         sr = pd.read_csv(candidates[0][1])
-    except Exception:
+    except (OSError, ValueError) as exc:
+        print(f"Could not read strategy results {candidates[0][1]}: {public_error(exc)}")
         return {}
     if sr.empty or 'Exit_Pct' not in sr.columns:
         return {}
@@ -212,8 +222,11 @@ def ensure_reminders_list(list_name):
     try:
         r = subprocess.run(['osascript', '-e', script],
                            capture_output=True, text=True, timeout=15)
+        if r.returncode != 0:
+            print(f"Reminders list setup failed: {r.stderr.strip() or r.stdout.strip()}")
         return r.returncode == 0
-    except Exception:
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"Reminders list setup failed: {public_error(exc)}")
         return False
 
 
@@ -237,8 +250,11 @@ def create_reminder(title, body, list_name=None):
     try:
         r = subprocess.run(['osascript', '-e', script],
                            capture_output=True, text=True, timeout=10)
+        if r.returncode != 0:
+            print(f"Reminder creation failed: {r.stderr.strip() or r.stdout.strip()}")
         return r.returncode == 0
-    except Exception:
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"Reminder creation failed: {public_error(exc)}")
         return False
 
 
@@ -582,8 +598,10 @@ def main():
     cand_file = os.path.join(ALERT_DIR,
                              f'Stock_Drop_Candidates_{prev.strftime("%Y-%m-%d")}.csv')
     if not os.path.exists(cand_file):
-        print(f'No candidates file from previous session ({cand_file}) — done.')
+        print(f'No candidates file from previous session ({cand_file}). '
+              f'Run stock_drop_watchlist.py for {prev.strftime("%Y-%m-%d")} first.')
         return
+    require_env('FMP_API_KEY', 'POLYGON_API_KEY')
 
     if not os.path.exists(RULES_FILE):
         print(f'⚠ {RULES_FILE} missing — run stock_drop_v2_validation.py first.')
@@ -635,8 +653,8 @@ def main():
                 try:
                     os.remove(out_txt)
                     print(f'Removed partial output after failure: {out_txt}')
-                except OSError:
-                    pass
+                except OSError as exc:
+                    print(f'Could not remove partial output {out_txt}: {public_error(exc)}')
             else:
                 print(f'Saved: {out_txt}')
 

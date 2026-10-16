@@ -34,6 +34,8 @@ import pandas as pd
 import requests
 from dotenv import load_dotenv
 
+from stock_drop_errors import public_error
+
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(_SCRIPT_DIR, '.env'))
 
@@ -69,8 +71,9 @@ def _fmp_get_json(url, timeout=20):
         _last_fmp_ts = time.time()
         resp.raise_for_status()
         return resp.json()
-    except Exception:
+    except (requests.RequestException, ValueError) as exc:
         _last_fmp_ts = time.time()
+        print(f"FMP request failed: {public_error(exc)}")
         return None
 
 
@@ -138,7 +141,8 @@ class PITAnalyzer:
             try:
                 with open(path, 'rb') as f:
                     cached = pickle.load(f)
-            except Exception:
+            except (OSError, pickle.UnpicklingError, EOFError) as exc:
+                print(f"Could not read daily cache {path}: {public_error(exc)}")
                 cached = None
 
         needs_fetch = cached is None
@@ -157,8 +161,8 @@ class PITAnalyzer:
                     try:
                         with open(path, 'wb') as f:
                             pickle.dump(fresh, f)
-                    except Exception:
-                        pass
+                    except OSError as exc:
+                        print(f"Could not write daily cache {path}: {public_error(exc)}")
                 else:
                     df = cached
             elif cached is not None:
@@ -210,15 +214,16 @@ class PITAnalyzer:
             try:
                 with open(EARNINGS_CACHE_FILE, 'rb') as f:
                     self._earnings = pickle.load(f)
-            except Exception:
+            except (OSError, pickle.UnpicklingError, EOFError) as exc:
+                print(f"Could not read earnings cache {EARNINGS_CACHE_FILE}: {public_error(exc)}")
                 self._earnings = {}
 
     def _save_earnings_cache(self):
         try:
             with open(EARNINGS_CACHE_FILE, 'wb') as f:
                 pickle.dump(self._earnings, f)
-        except Exception:
-            pass
+        except OSError as exc:
+            print(f"Could not write earnings cache {EARNINGS_CACHE_FILE}: {public_error(exc)}")
 
     EARNINGS_CACHE_MAX_AGE_DAYS = 7
 

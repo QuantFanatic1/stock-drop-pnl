@@ -2,12 +2,12 @@
 """
 Stock Drop P&L Tracker
 -----------------------
-Tracks option positions from the stock drop watchlist with $1,000 entry
-per trade, enforcing TP/SL rules.
+Paper-trades option positions from the stock drop watchlist at $2,000
+per trade, enforcing the exit table in stock_drop_exit_rules.py.
 
-Positions are logged when the watchlist generates plays. A daily update
-checks current option prices and closes positions that hit TP, SL, or
-reach day 10 (max hold).
+Positions are logged when confirmation accepts a candidate. A daily update
+checks option prices and closes positions that hit the take-profit, the
+-40% stop, or the book's hold limit (10 trading days, or 20 on the 3m20 book).
 
 Usage:
     python stock_drop_pnl_tracker.py                # Update all open positions
@@ -30,6 +30,7 @@ from datetime import datetime, date, timedelta
 from dotenv import load_dotenv
 from tabulate import tabulate
 
+from stock_drop_errors import public_error, require_env
 from stock_drop_exit_rules import STANDARD_SL_PCT, resolve_take_profit
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -53,6 +54,16 @@ FILL_WINDOW_DAYS = 3       # Trading days after entry_date to keep checking for 
 # Polygon rate limiting
 _last_polygon_ts = 0.0
 POLYGON_MIN_INTERVAL = 0.35
+_tz_fallback_reported = False
+
+
+def _report_tz_fallback(exc):
+    """Print the first timezone failure. Later bars keep the UTC-offset fallback."""
+    global _tz_fallback_reported
+    if _tz_fallback_reported:
+        return
+    _tz_fallback_reported = True
+    print(f"Timezone conversion failed ({public_error(exc)}). Using a fixed UTC offset.")
 
 
 def _polygon_get(url, params):
@@ -61,16 +72,19 @@ def _polygon_get(url, params):
     elapsed = time.time() - _last_polygon_ts
     if elapsed < POLYGON_MIN_INTERVAL:
         time.sleep(POLYGON_MIN_INTERVAL - elapsed)
+    label = url.split('?')[0].replace(POLYGON_BASE, '')
     try:
         resp = requests.get(url, params=params, timeout=15)
-    except requests.RequestException:
+    except requests.RequestException as exc:
+        print(f"Polygon request failed for {label}: {public_error(exc)}")
         return None
     _last_polygon_ts = time.time()
     if resp.status_code == 429:
         time.sleep(2)
         try:
             resp = requests.get(url, params=params, timeout=15)
-        except requests.RequestException:
+        except requests.RequestException as exc:
+            print(f"Polygon retry failed for {label}: {public_error(exc)}")
             return None
         _last_polygon_ts = time.time()
     return resp
@@ -126,8 +140,8 @@ def get_option_quote(option_ticker):
                     'low': day.get('low', 0),
                     'volume': day.get('volume', 0),
                 }
-        except (ValueError, KeyError):
-            pass
+        except (ValueError, KeyError) as exc:
+            print(f"Could not parse the snapshot for {option_ticker}: {public_error(exc)}")
 
     # Fallback: use previous day close from aggregates
     prev_url = f'{POLYGON_BASE}/v2/aggs/ticker/{option_ticker}/prev'
@@ -145,8 +159,8 @@ def get_option_quote(option_ticker):
                     'low': bar.get('l', 0),
                     'volume': bar.get('v', 0),
                 }
-        except (ValueError, KeyError):
-            pass
+        except (ValueError, KeyError) as exc:
+            print(f"Could not parse the previous close for {option_ticker}: {public_error(exc)}")
 
     return None
 
@@ -188,7 +202,8 @@ def get_option_entry_price(option_ticker, entry_date_str,
 
     try:
         bars = resp.json().get('results', []) or []
-    except (ValueError, KeyError):
+    except (ValueError, KeyError) as exc:
+        print(f"Could not parse entry bars for {option_ticker}: {public_error(exc)}")
         return None, None
 
     for bar in bars:
@@ -207,8 +222,9 @@ def _ts_to_pt(ms):
         from zoneinfo import ZoneInfo
         dt = datetime.fromtimestamp(ms / 1000, tz=ZoneInfo('America/Los_Angeles'))
         return dt.strftime('%H:%M')
-    except Exception:
+    except Exception as exc:
         # Fallback: approximate PDT (UTC-7) Mar-Oct, PST (UTC-8) otherwise
+        _report_tz_fallback(exc)
         dt = datetime.utcfromtimestamp(ms / 1000)
         offset = 7 if 3 <= dt.month <= 10 else 8
         return (dt - timedelta(hours=offset)).strftime('%H:%M')
@@ -225,7 +241,8 @@ def _fetch_minute_bars(option_ticker, date_str):
         return []
     try:
         return resp.json().get('results', []) or []
-    except (ValueError, KeyError):
+    except (ValueError, KeyError) as exc:
+        print(f"Could not parse minute bars for {option_ticker} on {date_str}: {public_error(exc)}")
         return []
 
 
@@ -245,8 +262,9 @@ def _minute_price_near(option_ticker, date_str, hour_et=15, minute_et=45):
             hour=hour_et, minute=minute_et,
             tzinfo=ZoneInfo('America/New_York'))
         target_ms = target_dt.timestamp() * 1000
-    except Exception:
+    except Exception as exc:
         # Fallback: approximate EDT (UTC-4) Mar-Oct, EST (UTC-5) otherwise
+        _report_tz_fallback(exc)
         d = datetime.strptime(date_str, '%Y-%m-%d')
         offset = 4 if 3 <= d.month <= 10 else 5
         target_ms = ((d.replace(hour=hour_et, minute=minute_et)
@@ -312,7 +330,8 @@ def get_option_close_price(option_ticker, entry_date_str,
 
     try:
         bars = resp.json().get('results', []) or []
-    except (ValueError, KeyError):
+    except (ValueError, KeyError) as exc:
+        print(f"Could not parse close bars for {option_ticker}: {public_error(exc)}")
         return None, None
 
     for bar in bars:
@@ -353,8 +372,8 @@ def get_option_daily_bars(option_ticker, start_date, end_date):
     if resp and resp.status_code == 200:
         try:
             return resp.json().get('results', [])
-        except (ValueError, KeyError):
-            pass
+        except (ValueError, KeyError) as exc:
+            print(f"Could not parse daily bars for {option_ticker}: {public_error(exc)}")
     return []
 
 
@@ -1421,6 +1440,8 @@ def main():
     # Allow --sell, --summary, --open on weekends without --force
     needs_market = not (args.summary or args.sell or args.show_open
                         or args.set_entry or args.reset)
+    if needs_market:
+        require_env('POLYGON_API_KEY')
     if not args.force and needs_market and datetime.now().weekday() >= 5:
         print("Weekend — use --force to run or --summary to view.")
         return

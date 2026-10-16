@@ -19,11 +19,22 @@
 !stock_drop_3m_pnl_tracker.py
 !run_stock_drop_pnl.sh
 !run_stock_drop_confirmation.sh
+!stock_drop_errors.py
+!vix_history.csv
+!LICENSE
+!tests/
+!tests/test_exit_rules.py
+!tests/test_market_holidays.py
+!.github/
+!.github/workflows/
+!.github/workflows/tests.yml
 
-# Rules the confirmation step reads. Nothing else under this folder.
+# Rules and the prior-trade file the confirmation step reads.
+# P&L books and scan archives under this folder stay out.
 !Stock_Drop_Alert/
 Stock_Drop_Alert/*
 !Stock_Drop_Alert/stock_drop_v2_rules.json
+!Stock_Drop_Alert/Stock_Drop_Strategy_Results_2026-10-05.csv
 
 # --- Secrets and local config. These stay ignored even if the
 #     allowlist above is widened later. ---
