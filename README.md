@@ -44,17 +44,17 @@ Generated paper books, alert archives, and logs stay out of git. See `.gitignore
 
 Filled closed trades only. A row counts as filled when the option traded enough volume to enter. Open trades and no-fills are excluded. A win is an exit P&L above $0. Average return is the mean option-premium percent.
 
-Main book marked through 2026-10-16. The two 3-month books were last marked on 2026-10-15.
+Main book marked through 2026-10-21. The two 3-month books were last marked on 2026-10-21.
 
 | Book | Filled trades | Win rate | Average return | Average P&L |
 |---|---:|---:|---:|---:|
-| Main, 10-day hold (entries 2026-03-24 to 2026-10-15) | 746 | 35.4% | +8.3% | +$224 |
-| 3-month, 10-day hold (entries 2026-07-14 to 2026-10-13) | 189 | 36.5% | −7.0% | −$148 |
-| 3-month, 20-day hold (entries 2026-07-14 to 2026-10-13) | 184 | 29.3% | −10.3% | −$368 |
+| Main, 10-day hold (entries 2026-03-24 to 2026-10-15) | 751 | 35.2% | +7.9% | +$218 |
+| 3-month, 10-day hold (entries 2026-07-14 to 2026-10-15) | 197 | 35.0% | −8.3% | −$176 |
+| 3-month, 20-day hold (entries 2026-07-14 to 2026-10-15) | 194 | 28.4% | −11.2% | −$382 |
 
 On the main book the median filled trade is the −40% stop. The average is higher because the winners are larger than the losers. These are paper marks, not broker fills.
 
-The filled trades behind this table are in `paper_results_filled.csv` (1,119 rows: 746 + 189 + 184). Count the rows in a book, the share with `exit_pnl` above 0, and the mean of `exit_pnl_pct`. The averages above are that mean, rounded to one decimal for the percent and to the nearest dollar.
+The filled trades behind this table are in `paper_results_filled.csv` (1,142 rows: 751 + 197 + 194). Count the rows in a book, the share with `exit_pnl` above 0, and the mean of `exit_pnl_pct`. The averages above are that mean, rounded to one decimal for the percent and to the nearest dollar.
 
 ## Daily run
 
@@ -70,6 +70,17 @@ From this directory, on a trading day:
 `run_stock_drop_confirmation.sh` confirms the day and adds rows to the main book and both live 3-month books. `run_stock_drop_pnl.sh` marks those books and updates the 20-day experiment.
 
 `python3 stock_drop_pnl_tracker.py --summary` reprints a book without fetching new prices.
+
+## Weekly publish
+
+Every Friday at 14:00 local — one hour after the 13:00 Pacific close — `run_stock_drop_weekly_publish.sh` re-marks the three live books with closing prices, rebuilds both published CSVs, and pushes them to this repo.
+
+- `paper_results_filled.csv` — every filled, closed trade (regenerated from the books).
+- `paper_results_summary.csv` — one row per book plus a `TOTAL` row: open positions, closed trades, win rate, realized P&L, unrealized P&L, total P&L, money invested in open positions, and total invested to date.
+
+The `TOTAL` row adds all three books, so it double-counts the two 3-month books, which hold the same contracts. Read the per-book rows for the clean view.
+
+`python3 publish_paper_results.py` rebuilds both CSVs without committing; `--commit` stages exactly those two files, commits, and pushes.
 
 ## Tests
 

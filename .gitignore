@@ -17,11 +17,14 @@
 !stock_drop_pit.py
 !stock_drop_pnl_tracker.py
 !stock_drop_3m_pnl_tracker.py
+!publish_paper_results.py
 !run_stock_drop_pnl.sh
 !run_stock_drop_confirmation.sh
+!run_stock_drop_weekly_publish.sh
 !stock_drop_errors.py
 !vix_history.csv
 !paper_results_filled.csv
+!paper_results_summary.csv
 !LICENSE
 !tests/
 !tests/test_exit_rules.py
