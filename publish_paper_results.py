@@ -2,17 +2,19 @@
 """Regenerate the published paper-trade CSVs from the live P&L books.
 
 Outputs (repo root):
-  paper_results_filled.csv  — one row per filled, closed trade across the
-                              three live books (matches the README table)
+  paper_results_filled_<book>.csv — the filled, closed trades of each live
+                              book in its OWN file (main_10d, 3m_10d,
+                              3m_20d); the books are never combined into
+                              one table
   paper_results_summary.csv — per-book + TOTAL snapshot: realized P&L,
                               unrealized P&L, total P&L, money invested
 
 A trade counts as filled only when entry_price was recorded (low-volume /
 no-fill candidates never invested money and are excluded). Open positions
-are excluded from the filled CSV but drive the unrealized and
+are excluded from the filled CSVs but drive the unrealized and
 money-invested-open columns of the summary.
 
-With --commit, stages exactly these two files, commits, and pushes to
+With --commit, stages exactly these output files, commits, and pushes to
 origin/main. It never runs `git add .` — the rest of this directory is
 not for git (see .gitignore).
 """
@@ -36,7 +38,13 @@ BOOKS = [
     ('3m_20d', os.path.join(ALERT_DIR, 'stock_drop_3m20_live_pnl.json')),
 ]
 
-FILLED_CSV = os.path.join(REPO, 'paper_results_filled.csv')
+FILLED_FILES = {
+    'main_10d': 'paper_results_filled_main_10d.csv',
+    '3m_10d': 'paper_results_filled_3m_10d.csv',
+    '3m_20d': 'paper_results_filled_3m_20d.csv',
+}
+# The old all-books combined file; removed in favor of the per-book files.
+RETIRED_FILLED = 'paper_results_filled.csv'
 SUMMARY_CSV = os.path.join(REPO, 'paper_results_summary.csv')
 
 
@@ -53,28 +61,22 @@ def load_book(path):
     return closed, open_filled, data.get('last_update', '')
 
 
-def write_filled_csv():
-    rows = []
+def write_filled_csvs():
+    """One CSV per book — the books are never combined into one table."""
+    cols = ['symbol', 'entry_date', 'exit_date', 'status',
+            'exit_pnl', 'exit_pnl_pct']
+    counts = {}
     for label, path in BOOKS:
         closed, _, _ = load_book(path)
-        for p in closed:
-            rows.append({
-                'book': label,
-                'symbol': p.get('symbol'),
-                'entry_date': p.get('entry_date'),
-                'exit_date': p.get('exit_date'),
-                'status': p.get('status'),
-                'exit_pnl': p.get('exit_pnl'),
-                'exit_pnl_pct': p.get('exit_pnl_pct'),
-            })
-    rows.sort(key=lambda r: (r['book'], r['entry_date'] or '', r['symbol']))
-    cols = ['book', 'symbol', 'entry_date', 'exit_date', 'status',
-            'exit_pnl', 'exit_pnl_pct']
-    with open(FILLED_CSV, 'w', newline='') as f:
-        w = csv.DictWriter(f, fieldnames=cols)
-        w.writeheader()
-        w.writerows(rows)
-    return rows
+        rows = sorted(closed, key=lambda p: (p.get('entry_date') or '',
+                                             p.get('symbol') or ''))
+        out = os.path.join(REPO, FILLED_FILES[label])
+        with open(out, 'w', newline='') as f:
+            w = csv.DictWriter(f, fieldnames=cols)
+            w.writeheader()
+            w.writerows([{c: p.get(c) for c in cols} for p in rows])
+        counts[label] = len(rows)
+    return counts
 
 
 def summarize_book(closed, open_pos):
@@ -137,8 +139,14 @@ def git(*args):
 
 
 def commit_and_push():
-    staged = git('add', '--', os.path.basename(FILLED_CSV),
-                 os.path.basename(SUMMARY_CSV))
+    staged_names = [FILLED_FILES[label] for label, _ in BOOKS]
+    staged_names.append(os.path.basename(SUMMARY_CSV))
+    # One-time transition: remove the old combined file from the repo.
+    retired_path = os.path.join(REPO, RETIRED_FILLED)
+    if os.path.exists(retired_path):
+        os.remove(retired_path)
+        staged_names.append(RETIRED_FILLED)
+    staged = git('add', '--', *staged_names)
     if staged.returncode != 0:
         print('git add failed:', staged.stderr.strip())
         return 1
@@ -162,11 +170,12 @@ def main():
     parser = argparse.ArgumentParser(
         description='Rebuild the published paper-trade CSVs from the live books.')
     parser.add_argument('--commit', action='store_true',
-                        help='Commit the two CSVs and push to origin/main.')
+                        help='Commit the output CSVs and push to origin/main.')
     args = parser.parse_args()
 
-    filled = write_filled_csv()
-    print(f'paper_results_filled.csv: {len(filled)} closed trades')
+    counts = write_filled_csvs()
+    for label, _ in BOOKS:
+        print(f'{FILLED_FILES[label]}: {counts[label]} closed trades')
 
     summary = write_summary_csv()
     for row in summary:

@@ -54,7 +54,7 @@ Main book marked through 2026-10-21. The two 3-month books were last marked on 2
 
 On the main book the median filled trade is the −40% stop. The average is higher because the winners are larger than the losers. These are paper marks, not broker fills.
 
-The filled trades behind this table are in `paper_results_filled.csv` (1,142 rows: 751 + 197 + 194). Count the rows in a book, the share with `exit_pnl` above 0, and the mean of `exit_pnl_pct`. The averages above are that mean, rounded to one decimal for the percent and to the nearest dollar.
+The filled trades behind this table are in one CSV per book — never combined into a single table: `paper_results_filled_main_10d.csv` (751 rows), `paper_results_filled_3m_10d.csv` (197 rows), `paper_results_filled_3m_20d.csv` (194 rows). Count the rows in a file, the share with `exit_pnl` above 0, and the mean of `exit_pnl_pct`. The averages above are that mean, rounded to one decimal for the percent and to the nearest dollar.
 
 ## Daily run
 
@@ -73,14 +73,14 @@ From this directory, on a trading day:
 
 ## Weekly publish
 
-Every Friday at 14:00 local — one hour after the 13:00 Pacific close — `run_stock_drop_weekly_publish.sh` re-marks the three live books with closing prices, rebuilds both published CSVs, and pushes them to this repo.
+Every Friday at 14:00 local — one hour after the 13:00 Pacific close — `run_stock_drop_weekly_publish.sh` re-marks the three live books with closing prices, rebuilds the published CSVs, and pushes them to this repo.
 
-- `paper_results_filled.csv` — every filled, closed trade (regenerated from the books).
+- `paper_results_filled_main_10d.csv`, `paper_results_filled_3m_10d.csv`, `paper_results_filled_3m_20d.csv` — the filled, closed trades of each book in its own file. The books are not combined into one table.
 - `paper_results_summary.csv` — one row per book plus a `TOTAL` row: open positions, closed trades, win rate, realized P&L, unrealized P&L, total P&L, money invested in open positions, and total invested to date.
 
 The `TOTAL` row adds all three books, so it double-counts the two 3-month books, which hold the same contracts. Read the per-book rows for the clean view.
 
-`python3 publish_paper_results.py` rebuilds both CSVs without committing; `--commit` stages exactly those two files, commits, and pushes.
+`python3 publish_paper_results.py` rebuilds the CSVs without committing; `--commit` stages exactly the output files, commits, and pushes.
 
 ## Tests
 

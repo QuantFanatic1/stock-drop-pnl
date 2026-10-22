@@ -23,7 +23,9 @@
 !run_stock_drop_weekly_publish.sh
 !stock_drop_errors.py
 !vix_history.csv
-!paper_results_filled.csv
+!paper_results_filled_main_10d.csv
+!paper_results_filled_3m_10d.csv
+!paper_results_filled_3m_20d.csv
 !paper_results_summary.csv
 !LICENSE
 !tests/
